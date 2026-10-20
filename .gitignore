@@ -3,3 +3,6 @@ dist
 .env
 .DS_Store
 *.local
+Downloads Triage.app
+macos/.build
+.build

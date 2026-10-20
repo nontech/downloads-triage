@@ -3,12 +3,8 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
-  server: {
-    host: "127.0.0.1",
-    port: 5173,
-    proxy: {
-      "/api": { target: "http://127.0.0.1:8787", timeout: 0, proxyTimeout: 0 },
-      "/thumbs": { target: "http://127.0.0.1:8787", timeout: 0, proxyTimeout: 0 },
-    },
+  build: {
+    outDir: "dist/client",
+    emptyOutDir: true,
   },
 });

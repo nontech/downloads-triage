@@ -36,7 +36,9 @@ export type FileRecord = {
   ageDays: number;
   rule: Rule;
   isImage: boolean;
+  duplicateOfId: string | null;
   duplicateOfName: string | null;
+  userKept: boolean;
   installedApp: string | null;
   textSample: string | null;
   sampleSent: boolean;
@@ -94,6 +96,7 @@ export type ScanResult = {
   kept: KeptFile[];
   hiddenCount: number;
   jevConfigured: boolean;
+  jevKeyRejected: boolean;
   downloadsPath: string;
   scannedAt: number;
 };

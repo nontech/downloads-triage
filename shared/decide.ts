@@ -81,6 +81,7 @@ export function decideDocument(file: FileRecord): Decision {
 }
 
 export function fileReason(file: FileRecord): string {
+  if (file.userKept) return "You left this in Downloads.";
   switch (file.rule) {
     case "screenshot":
       return screenshotReason(file);
@@ -117,6 +118,7 @@ function installerReason(file: FileRecord): string {
 }
 
 export function filePile(file: FileRecord, screenshotAgeDays: number): Pile {
+  if (file.userKept) return "keep";
   switch (file.rule) {
     case "duplicate":
     case "installer":

@@ -60,6 +60,11 @@ function asKind(value: string): JevKind {
   return KINDS.has(value as JevKind) ? (value as JevKind) : "other";
 }
 
+export function isKeyRejected(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b(401|403)\b|unauthori[sz]ed|invalid api key|incorrect api key|authentication failed/i.test(message);
+}
+
 export function safeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/sk-[a-zA-Z0-9_-]+/g, "sk-…").slice(0, 180);

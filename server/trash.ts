@@ -14,7 +14,11 @@ function run(argv) {
   for (const p of paths) {
     try {
       const item = Finder.delete(Path(p));
-      moved.push({ original: p, trashPath: pathFromItem(item) });
+      let trashPath = null;
+      try {
+        trashPath = pathFromItem(item);
+      } catch (error) {}
+      moved.push({ original: p, trashPath: trashPath });
     } catch (error) {
       moved.push({ original: p, trashPath: null, error: String(error) });
     }

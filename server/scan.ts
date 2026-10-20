@@ -4,7 +4,8 @@ import { homedir } from "node:os";
 import { basename, extname, join, sep } from "node:path";
 import { appForInstaller, installedAppNames } from "./apps.ts";
 import { sha256File } from "./hash.ts";
-import { classifyDocument, jevConfigured, safeError } from "./jev.ts";
+import { classifyDocument, isKeyRejected, jevConfigured, safeError } from "./jev.ts";
+import { JevCache } from "./jevCache.ts";
 import { pool } from "./pool.ts";
 import { textSample } from "./sample.ts";
 import { readSpotlight } from "./spotlight.ts";
@@ -17,7 +18,7 @@ import {
   isScreenshotName,
   isVideoExt,
 } from "../shared/signals.ts";
-import { LARGE_VIDEO_BYTES, type FileRecord, type KeptFile, type Progress, type Rule, type ScanResult } from "../shared/types.ts";
+import { LARGE_VIDEO_BYTES, type FileRecord, type Progress, type Rule, type ScanResult } from "../shared/types.ts";
 
 const DAY = 24 * 60 * 60 * 1000;
 const THUMB_LIMIT = 40 * 1024 * 1024;
@@ -34,6 +35,7 @@ type Entry = {
   lastUsedMs: number | null;
   whereFrom: string | null;
   hash: string | null;
+  userKept: boolean;
 };
 
 export async function scanDownloads(options: {
@@ -49,7 +51,6 @@ export async function scanDownloads(options: {
   options.onProgress({ phase: "listing", done: 0, total: 0, detail: "Listing Downloads" });
   const paths = await walk(root, options.signal);
   const entries: Entry[] = [];
-  const kept: KeptFile[] = [];
 
   for (const filePath of paths) {
     throwIfAborted(options.signal);
@@ -61,21 +62,7 @@ export async function scanDownloads(options: {
     }
     if (!fileStat.isFile()) continue;
     const mtimeMs = Math.round(fileStat.mtimeMs);
-    const match = options.store.keptMatch(filePath, fileStat.size, mtimeMs);
-    if (match) {
-      const ext = extname(filePath).toLowerCase();
-      kept.push({
-        id: createHash("sha1").update(filePath).digest("hex").slice(0, 16),
-        path: filePath,
-        name: basename(filePath),
-        ext,
-        size: fileStat.size,
-        mtimeMs,
-        decidedAt: match.decidedAt,
-        isImage: isImageExt(ext),
-      });
-      continue;
-    }
+    const userKept = Boolean(options.store.keptMatch(filePath, fileStat.size, mtimeMs));
     entries.push({
       path: filePath,
       name: basename(filePath),
@@ -88,6 +75,7 @@ export async function scanDownloads(options: {
       lastUsedMs: null,
       whereFrom: null,
       hash: null,
+      userKept,
     });
   }
 
@@ -153,10 +141,7 @@ export async function scanDownloads(options: {
   const configured = jevConfigured();
   const files: FileRecord[] = entries.map((entry) => toRecord(entry, duplicateOf.get(entry.path) ?? null, apps));
 
-  const images = [
-    ...files.filter((file) => file.isImage && file.size <= THUMB_LIMIT && file.size > 0),
-    ...kept.filter((file) => file.isImage && file.size <= THUMB_LIMIT && file.size > 0),
-  ];
+  const images = files.filter((file) => file.isImage && file.size <= THUMB_LIMIT && file.size > 0);
   options.onProgress({
     phase: "thumbnails",
     done: 0,
@@ -182,7 +167,7 @@ export async function scanDownloads(options: {
     }
   });
 
-  const documents = files.filter((file) => file.rule === "document");
+  const documents = files.filter((file) => file.rule === "document" && !file.userKept);
   options.onProgress({
     phase: "classifying",
     done: 0,
@@ -190,38 +175,72 @@ export async function scanDownloads(options: {
     detail: configured ? "Asking Jev about documents" : "Jev is not configured",
   });
   let classified = 0;
+  let keyRejected = false;
   if (configured) {
-    await pool(documents, 3, async (file) => {
-      throwIfAborted(options.signal);
-      try {
-        const sample = await textSample(file.path, file.ext, file.size);
-        file.textSample = sample;
-        file.sampleSent = Boolean(sample);
-        file.jev = await withTimeout(
-          classifyDocument({
-            file_name: file.name,
-            extension: file.ext || null,
-            size_bytes: file.size,
-            age_days: file.ageDays,
-            last_opened: file.lastUsedMs ? new Date(file.lastUsedMs).toISOString().slice(0, 10) : null,
-            download_source: file.whereFrom,
-            text_sample: sample ?? "",
-          }),
-          45_000,
-        );
-      } catch (error) {
-        if (options.signal.aborted) throw error;
-        file.jev = null;
-        file.jevSkippedReason = `Jev could not classify this file (${safeError(error)}). Left in Review.`;
-      }
-      classified += 1;
-      options.onProgress({
-        phase: "classifying",
-        done: classified,
-        total: documents.length,
-        detail: "Asking Jev about documents",
+    const cache = new JevCache();
+    await cache.load();
+    let reused = 0;
+    let sent = 0;
+    try {
+      await pool(documents, 3, async (file) => {
+        throwIfAborted(options.signal);
+        const saved = cache.match(file.path, file.name, file.size);
+        if (keyRejected) {
+          file.jev = null;
+          file.jevSkippedReason = "Left in Review.";
+        } else if (saved) {
+          file.jev = saved.jev;
+          file.textSample = saved.textSample;
+          file.sampleSent = Boolean(saved.textSample);
+          reused += 1;
+        } else {
+          try {
+            const sample = await textSample(file.path, file.ext, file.size);
+            file.textSample = sample;
+            file.sampleSent = Boolean(sample);
+            file.jev = await withTimeout(
+              classifyDocument({
+                file_name: file.name,
+                extension: file.ext || null,
+                size_bytes: file.size,
+                age_days: file.ageDays,
+                last_opened: file.lastUsedMs ? new Date(file.lastUsedMs).toISOString().slice(0, 10) : null,
+                download_source: file.whereFrom,
+                text_sample: sample ?? "",
+              }),
+              45_000,
+            );
+            if (file.jev) {
+              cache.remember(file.path, {
+                name: file.name,
+                size: file.size,
+                jev: file.jev,
+                textSample: file.textSample,
+              });
+            }
+            sent += 1;
+          } catch (error) {
+            if (options.signal.aborted) throw error;
+            file.jev = null;
+            if (isKeyRejected(error)) {
+              keyRejected = true;
+              file.jevSkippedReason = "Left in Review.";
+            } else {
+              file.jevSkippedReason = `Jev could not classify this file (${safeError(error)}). Left in Review.`;
+            }
+          }
+        }
+        classified += 1;
+        options.onProgress({
+          phase: "classifying",
+          done: classified,
+          total: documents.length,
+          detail: `${sent} sent to Jev, ${reused} reused`,
+        });
       });
-    });
+    } finally {
+      await cache.flush();
+    }
   } else {
     for (const file of documents) {
       file.jevSkippedReason = "Jev is not configured, so this document was not classified. Left in Review.";
@@ -231,9 +250,10 @@ export async function scanDownloads(options: {
   options.onProgress({ phase: "done", done: files.length, total: files.length, detail: "Scan complete" });
   return {
     files,
-    kept,
-    hiddenCount: kept.length,
+    kept: [],
+    hiddenCount: 0,
     jevConfigured: configured,
+    jevKeyRejected: keyRejected,
     downloadsPath: root,
     scannedAt: Date.now(),
   };
@@ -245,7 +265,11 @@ function isImageContentType(contentType: string | null): boolean {
   return type.startsWith("public.png") || type.startsWith("public.jpeg") || type.startsWith("public.gif") || type.startsWith("public.tiff") || type.startsWith("public.heic") || type.startsWith("public.webp") || type.startsWith("public.avif") || type.startsWith("image/");
 }
 
-function toRecord(entry: Entry, duplicateOfName: string | null, apps: string[]): FileRecord {
+function fileId(path: string): string {
+  return createHash("sha1").update(path).digest("hex").slice(0, 16);
+}
+
+function toRecord(entry: Entry, duplicateOf: { id: string; name: string } | null, apps: string[]): FileRecord {
   const addedMs = entry.addedMs ?? (entry.birthtimeMs || entry.mtimeMs);
   const ageDays = Math.max(0, Math.floor((Date.now() - addedMs) / DAY));
   const image = isImageExt(entry.ext) || isImageContentType(entry.contentType);
@@ -258,10 +282,10 @@ function toRecord(entry: Entry, duplicateOfName: string | null, apps: string[]):
   else if (screenshot) rule = "screenshot";
   else if (installer) rule = "installer";
   else if (document) rule = "document";
-  if (duplicateOfName) rule = "duplicate";
+  if (duplicateOf) rule = "duplicate";
 
   return {
-    id: createHash("sha1").update(entry.path).digest("hex").slice(0, 16),
+    id: fileId(entry.path),
     path: entry.path,
     name: entry.name,
     ext: entry.ext,
@@ -273,7 +297,9 @@ function toRecord(entry: Entry, duplicateOfName: string | null, apps: string[]):
     ageDays,
     rule,
     isImage: image,
-    duplicateOfName,
+    duplicateOfId: duplicateOf?.id ?? null,
+    duplicateOfName: duplicateOf?.name ?? null,
+    userKept: entry.userKept,
     installedApp: installer ? appForInstaller(entry.name, apps) : null,
     textSample: null,
     sampleSent: false,
@@ -289,7 +315,7 @@ function isDocumentCandidate(entry: Entry): boolean {
   return type.includes("pdf") || type.includes("text") || type.includes("json");
 }
 
-function duplicateKeepers(entries: Entry[]): Map<string, string> {
+function duplicateKeepers(entries: Entry[]): Map<string, { id: string; name: string }> {
   const groups = new Map<string, Entry[]>();
   for (const entry of entries) {
     if (!entry.hash) continue;
@@ -297,7 +323,7 @@ function duplicateKeepers(entries: Entry[]): Map<string, string> {
     if (list) list.push(entry);
     else groups.set(entry.hash, [entry]);
   }
-  const extras = new Map<string, string>();
+  const extras = new Map<string, { id: string; name: string }>();
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     const sorted = [...group].sort((a, b) => {
@@ -306,7 +332,8 @@ function duplicateKeepers(entries: Entry[]): Map<string, string> {
       return a.name.localeCompare(b.name);
     });
     const keeper = sorted[0];
-    for (const extra of sorted.slice(1)) extras.set(extra.path, keeper.name);
+    const keeperRef = { id: fileId(keeper.path), name: keeper.name };
+    for (const extra of sorted.slice(1)) extras.set(extra.path, keeperRef);
   }
   return extras;
 }

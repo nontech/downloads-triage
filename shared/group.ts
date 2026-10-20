@@ -13,6 +13,7 @@ const GROUP_ORDER = [
   "uncertain",
   "recent-screenshots",
   "kept-documents",
+  "left-by-you",
   "other",
 ] as const;
 
@@ -29,6 +30,7 @@ const TITLES: Record<GroupId, string> = {
   uncertain: "Uncertain",
   "recent-screenshots": "Recent screenshots",
   "kept-documents": "Documents to keep",
+  "left-by-you": "You left these here",
   other: "Other files",
 };
 
@@ -76,6 +78,7 @@ export function buildTriage(files: FileRecord[], screenshotAgeDays: number): {
 }
 
 function groupFor(file: FileRecord, pile: Pile): GroupId {
+  if (file.userKept) return "left-by-you";
   switch (file.rule) {
     case "duplicate":
       return "duplicates";
@@ -111,7 +114,7 @@ function groupReason(id: GroupId, members: FileView[], bytes: number, ageDays: n
         : `${count} ${noun(count, "installer")}, ${size}. These can usually be downloaded again.`;
     }
     case "duplicates":
-      return `Older exact copies, ${size}. The newest copy of each file stays.`;
+      return `Older copies, ${size}. Each newest copy is marked Stays and is not selected for trash.`;
     case "disposable":
       return `Documents Jev classified as safe to delete, ${size}.`;
     case "large-videos":
@@ -119,13 +122,15 @@ function groupReason(id: GroupId, members: FileView[], bytes: number, ageDays: n
     case "sensitive-docs":
       return "Invoices, exports, and other files that look sensitive. They are not part of suggested trash.";
     case "unconfigured":
-      return "These documents were not sent to Jev because TYPESAFE_API_KEY is not set. They stay in Review.";
+      return "These documents were not sent to Jev because no key is saved. They stay in Review.";
     case "uncertain":
       return "Jev was unsure, the file could not be read, or losing it looked costly.";
     case "recent-screenshots":
       return `Screenshots from the last ${ageDays} days.`;
     case "kept-documents":
       return "Documents that look worth keeping in Downloads.";
+    case "left-by-you":
+      return "You already chose to leave these in Downloads. They stay in this section.";
     default:
       return "Nothing suggested these should be deleted.";
   }
